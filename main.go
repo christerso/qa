@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/fatih/color"
+	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/manifoldco/promptui"
 	"io/ioutil"
@@ -17,8 +18,46 @@ import (
 var db *sql.DB
 
 func init() {
-	connStr := "host=localhost user=csoderlund password=makt dbname=qa sslmode=disable"
+	if _, err := os.Stat(".env"); err == nil {
+		err := godotenv.Load(".env")
+		if err != nil {
+			log.Fatalf("Error loading .env file: %v", err)
+		}
+	}
+
+	host := os.Getenv("STEPQA_DB_HOST")
+	if host == "" {
+		host = os.Getenv("STEPQA_DB_HOST")
+		if host == "" {
+			log.Fatal("STEPQA_DB_HOST environment variable not set")
+		}
+	}
+
+	username := os.Getenv("STEPQA_DB_USERNAME")
+	if username == "" {
+		username = os.Getenv("STEPQA_DB_USERNAME")
+		if username == "" {
+			log.Fatal("STEPQA_DB_USERNAME environment variable not set")
+		}
+	}
+
+	password := os.Getenv("STEPQA_DB_PASSWORD")
+	if password == "" {
+		password = os.Getenv("STEPQA_DB_PASSWORD")
+		if password == "" {
+			log.Fatal("STEPQA_DB_PASSWORD environment variable not set")
+		}
+	}
+
+	database := os.Getenv("STEPQA_DB_NAME")
+	if database == "" {
+		database = os.Getenv("STEPQA_DB_NAME")
+		if database == "" {
+			log.Fatal("STEPQA_DB_NAME environment variable not set")
+		}
+	}
 	var err error
+	connStr := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", username, password, host, database)
 	db, err = sql.Open("postgres", connStr)
 	if err != nil {
 		log.Fatal(err)
@@ -41,13 +80,7 @@ type QA struct {
 }
 
 func printLogo() {
-	logo := `
-  ____                    _   ____  
- / ___| _   _  __ _ _ __ | |_/ ___| 
- \___ \| | | |/ _\ | '_ \| __\___ \ 
-  ___) | |_| | (_| | | | | |_ ___) |
- |____/ \__, |\__,_|_| |_|\__|____/ 
-        |___/                       
+	logo := `### StepQA ###                   
 `
 	fmt.Println(logo)
 }
@@ -188,32 +221,88 @@ func toggleCompletion(checkmarks map[int][]int) {
 	}
 	id, _ := strconv.Atoi(idStr)
 
-	stepPrompt := promptui.Prompt{
-		Label: "Enter the step number to toggle",
-	}
-	stepStr, err := stepPrompt.Run()
+	qa, err := getQAByID(id)
 	if err != nil {
-		fmt.Printf("Prompt failed: %v\n", err)
+		fmt.Printf("Error fetching Q&A by ID: %v\n", err)
 		return
 	}
-	step, _ := strconv.Atoi(stepStr)
 
-	if checkmarks[id] == nil {
-		checkmarks[id] = []int{}
-	}
+	stepItems := make([]string, len(qa.Steps))
 
-	found := false
-	for i, doneStep := range checkmarks[id] {
-		if doneStep == step {
-			checkmarks[id] = append(checkmarks[id][:i], checkmarks[id][i+1:]...)
-			found = true
-			break
+	updateStepItems := func() {
+		for i, step := range qa.Steps {
+			checked := ""
+			for _, doneStep := range checkmarks[id] {
+				if doneStep == i+1 {
+					checked = "✓ "
+					break
+				}
+			}
+			stepWithoutNumber := strings.Join(strings.Split(step, " ")[1:], " ")
+			stepItems[i] = fmt.Sprintf("%d. %s%s", i+1, checked, stepWithoutNumber)
 		}
 	}
 
-	if !found {
-		checkmarks[id] = append(checkmarks[id], step)
+	updateStepItems()
+
+	stepPrompt := promptui.Select{
+		Label:        "Select a step to toggle (press Ctrl-C to finish)",
+		Items:        stepItems,
+		HideSelected: true,
 	}
+
+	for {
+		_, stepStr, err := stepPrompt.Run()
+		if err != nil {
+			if err == promptui.ErrAbort {
+				break
+			} else {
+				fmt.Printf("Prompt failed: %v\n", err)
+				return
+			}
+		}
+
+		stepIndexStr := strings.Split(stepStr, ".")[0]
+		stepIndex, err := strconv.Atoi(stepIndexStr)
+		if err != nil {
+			fmt.Printf("Error converting step index to integer: %v\n", err)
+			return
+		}
+
+		if checkmarks[id] == nil {
+			checkmarks[id] = []int{}
+		}
+
+		found := false
+		for i, doneStep := range checkmarks[id] {
+			if doneStep == stepIndex {
+				checkmarks[id] = append(checkmarks[id][:i], checkmarks[id][i+1:]...)
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			checkmarks[id] = append(checkmarks[id], stepIndex)
+		}
+
+		updateStepItems()
+	}
+}
+
+func getQAByID(id int) (QA, error) {
+	allQA, err := listAll()
+	if err != nil {
+		return QA{}, err
+	}
+
+	for _, qa := range allQA {
+		if qa.ID == id {
+			return qa, nil
+		}
+	}
+
+	return QA{}, fmt.Errorf("Q&A not found for ID: %d", id)
 }
 
 func addQA(qa QA) error {
@@ -234,7 +323,7 @@ func deleteQA(id int) error {
 }
 
 func readCheckmarks() (map[int][]int, error) {
-	data, err := ioutil.ReadFile("checkmarks.json")
+	data, err := os.ReadFile("checkmarks.json")
 	if err != nil {
 		if os.IsNotExist(err) {
 			return make(map[int][]int), nil
@@ -246,6 +335,29 @@ func readCheckmarks() (map[int][]int, error) {
 	return checkmarks, nil
 }
 
+func resetCompletionForID(checkmarks map[int][]int, id int) {
+	if checkmarks[id] != nil {
+		checkmarks[id] = []int{}
+		err := updateCheckmarks(checkmarks)
+		if err != nil {
+			log.Fatal(err)
+		}
+		color.New(color.FgGreen).Printf("Checkmarks reset successfully for ID %d.\n", id)
+	} else {
+		color.New(color.FgRed).Printf("No checkmarks found for ID %d.\n", id)
+	}
+}
+
+func resetAllCheckmarks(checkmarks map[int][]int) {
+	for id := range checkmarks {
+		checkmarks[id] = []int{}
+	}
+	err := updateCheckmarks(checkmarks)
+	if err != nil {
+		log.Fatal(err)
+	}
+	color.New(color.FgGreen).Println("All checkmarks reset successfully.")
+}
 func getQAsByID(ids []int) ([]QA, error) {
 	allQA, err := listAll()
 	if err != nil {
@@ -282,7 +394,18 @@ func main() {
 	}
 
 	for {
-		actions := []string{"List QAs by ID", "List all Q&A", "Search for Q&A", "Add Q&A", "Update Q&A", "Delete Q&A", "Toggle step completion", "Exit"}
+		actions := []string{
+			"List QAs by ID",
+			"List all Q&A",
+			"Search for Q&A",
+			"Add Q&A",
+			"Update Q&A",
+			"Delete Q&A",
+			"Toggle step completion",
+			"Reset all step checkmarks",
+			"Reset step checkmarks for a specific ID",
+			"Exit",
+		}
 
 		// Calculate the number of lines required to display the longest action string
 		maxLines := 0
@@ -361,6 +484,7 @@ func main() {
 				fmt.Printf("Prompt failed: %v\n", err)
 				return
 			}
+			fmt.Println()
 			updateID, _ := strconv.Atoi(updateIDStr)
 			allQA, err := listAll()
 			if err != nil {
@@ -404,9 +528,21 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
-			color.New(color.FgGreen).Printf("Step completion status updated.\n")
+		case "Reset all step checkmarks":
+			resetAllCheckmarks(checkmarks)
+		case "Reset step checkmarks for a specific ID":
+			resetIDPrompt := promptui.Prompt{
+				Label: "Enter the ID of the Q&A to reset checkmarks",
+			}
+			resetIDStr, err := resetIDPrompt.Run()
+			if err != nil {
+				fmt.Printf("Prompt failed: %v\n", err)
+				return
+			}
+			resetID, _ := strconv.Atoi(resetIDStr)
+			resetCompletionForID(checkmarks, resetID)
 		case "Exit":
-			fmt.Println("Goodbye!")
+			color.New(color.FgCyan).Printf("Goodbye!\n")
 			return
 		}
 	}
